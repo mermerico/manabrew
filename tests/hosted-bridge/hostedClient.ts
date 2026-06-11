@@ -26,6 +26,7 @@ export type HostedAction = {
   label?: string;
   kind?: string;
   cardId?: string;
+  cost?: string;
 };
 
 export type HostedStartGameRequest = {
@@ -43,6 +44,19 @@ export type HostedStartGameRequest = {
 export type HostedSessionHandle = {
   sessionId: string;
   playerIndexes: number[];
+};
+
+export type HostedSnapshotPlayer = {
+  life?: number;
+  hand?: unknown[];
+  graveyard?: unknown[];
+  [key: string]: unknown;
+};
+
+export type HostedSnapshot = {
+  players?: HostedSnapshotPlayer[];
+  stack?: unknown[];
+  [key: string]: unknown;
 };
 
 const root = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -136,6 +150,11 @@ export class HostedHarness {
 
   async getGameOver(sessionId: string) {
     return (await this.request("getGameOver", { sessionId }, 30_000)) === "true";
+  }
+
+  async getSnapshot(sessionId: string) {
+    const raw = await this.request("getSnapshot", { sessionId }, 30_000);
+    return JSON.parse(raw) as HostedSnapshot;
   }
 
   async waitForPrompt<TPrompt extends HostedPrompt>(

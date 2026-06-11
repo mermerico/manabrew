@@ -4,12 +4,13 @@ import {
   card,
   findAction,
   HostedHarness,
+  type HostedSnapshot,
   type HostedPrompt,
   type PromptResult,
 } from "./hostedClient";
 
 type PriorityPrompt = HostedPrompt & {
-  actions: Array<{ index: number; label?: string; kind?: string }>;
+  actions: Array<{ index: number; label?: string; kind?: string; cardId?: string; cost?: string }>;
 };
 
 const opponentDeck = [
@@ -40,7 +41,7 @@ function blackLotuses(count: number) {
   return Array.from({ length: count }, () => card("Black Lotus"));
 }
 
-async function startAtOpeningPriority(deck: Array<{ name: string }>) {
+async function startAtOpeningPriority(deck: Array<{ name: string }>, opponent = opponentDeck) {
   const candidate = HostedHarness.launch();
   const handle = await candidate.startGame({
     gameId: `hosted-bridge-${Date.now()}`,
@@ -48,7 +49,7 @@ async function startAtOpeningPriority(deck: Array<{ name: string }>) {
     seed: 1,
     players: [
       { name: "Tester", ai: false, deck },
-      { name: "Opponent", ai: true, deck: opponentDeck },
+      { name: "Opponent", ai: true, deck: opponent },
     ],
   });
   let cursor = await candidate.waitForPrompt(handle.sessionId);
@@ -96,6 +97,47 @@ async function waitForGameOver(sessionId: string, timeoutMs = 10_000) {
   throw new Error("timed out waiting for game over");
 }
 
+async function waitForSnapshot(
+  sessionId: string,
+  accepts: (snapshot: HostedSnapshot) => boolean,
+  timeoutMs = 10_000,
+) {
+  if (!harness) {
+    throw new Error("harness not started");
+  }
+  const deadline = Date.now() + timeoutMs;
+  let last: HostedSnapshot | null = null;
+  while (Date.now() < deadline) {
+    last = await harness.getSnapshot(sessionId);
+    if (accepts(last)) {
+      return last;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timed out waiting for snapshot; last=${JSON.stringify(last)}`);
+}
+
+function player(snapshot: HostedSnapshot, index: number) {
+  const candidate = snapshot.players?.[index];
+  if (!candidate) {
+    throw new Error(`missing player ${index}`);
+  }
+  return candidate;
+}
+
+function playerLife(snapshot: HostedSnapshot, index: number) {
+  const life = player(snapshot, index).life;
+  if (typeof life !== "number") {
+    throw new Error(`missing life for player ${index}`);
+  }
+  return life;
+}
+
+function zoneSize(snapshot: HostedSnapshot, index: number, zone: "hand" | "graveyard") {
+  const cards = player(snapshot, index)[zone];
+  return Array.isArray(cards) ? cards.length : 0;
+}
+
 async function passUntilAction(
   sessionId: string,
   current: PromptResult,
@@ -141,7 +183,7 @@ async function castSpellAndReturnPriority(
   return chooseAction(sessionId, spellPriority, action.index, "priority");
 }
 
-async function activateManaAbility(
+async function activatePriorityManaAbility(
   sessionId: string,
   current: PromptResult,
   cardName: string,
@@ -149,14 +191,64 @@ async function activateManaAbility(
 ) {
   const manaPriority = await passUntilAction(sessionId, current, cardName, "mana");
   const action = findAction(manaPriority.prompt, cardName, "mana");
-  let cursor = await chooseAction(sessionId, manaPriority, action.index, "confirm_action");
+  if (cardName === "Black Lotus") {
+    expect(action.cost).toMatch(/\bAny\b/);
+  }
+  await harness!.submitAction(sessionId, {
+    kind: "tap_land",
+    manaAbilityIndex: action.index,
+    cardId: action.cardId,
+    color,
+  });
+  const cursor = await harness!.waitForPrompt(sessionId, {
+    kind: "confirm_action",
+    afterRaw: manaPriority.raw,
+  });
+  const description =
+    typeof cursor.prompt.description === "string" ? cursor.prompt.description : "";
+  expect(description).toContain(cardName);
+  expect(description).not.toContain("CARDNAME");
   await harness!.submitAction(sessionId, { kind: "boolean_decision", accept: true });
-  cursor = await harness!.waitForPrompt(sessionId, {
-    kind: "choose_color",
+  return harness!.waitForPrompt<PriorityPrompt>(sessionId, {
+    kind: "priority",
     afterRaw: cursor.raw,
   });
-  await harness!.submitAction(sessionId, { kind: "string_decision", value: color });
-  return harness!.waitForPrompt(sessionId, { kind: "priority", afterRaw: cursor.raw });
+}
+
+async function addBlackLotusMana(
+  sessionId: string,
+  current: PromptResult,
+  count: number,
+  color: string,
+) {
+  let cursor = current;
+  for (let i = 0; i < count; i += 1) {
+    cursor = await castSpellAndReturnPriority(sessionId, cursor, "Black Lotus");
+    cursor = await activatePriorityManaAbility(sessionId, cursor, "Black Lotus", color);
+  }
+  return cursor;
+}
+
+async function castTormentForX(sessionId: string, current: PromptResult, xValue: number) {
+  const tormentPriority = await passUntilAction(sessionId, current, "Torment of Hailfire");
+  const action = findAction(tormentPriority.prompt, "Torment of Hailfire");
+  let cursor = await chooseAction(sessionId, tormentPriority, action.index, "choose_number");
+  await harness!.submitAction(sessionId, { kind: "number_decision", number: xValue });
+  cursor = await harness!.waitForPrompt(sessionId, {
+    kind: "pay_mana_cost",
+    afterRaw: cursor.raw,
+  });
+  await harness!.submitAction(sessionId, { kind: "pay_mana" });
+  cursor = await harness!.waitForPrompt<PriorityPrompt>(sessionId, {
+    kind: "priority",
+    afterRaw: cursor.raw,
+  });
+  await harness!.submitAction(sessionId, { kind: "pass" });
+  return harness!.waitForPrompt<PriorityPrompt>(sessionId, {
+    kind: "priority",
+    afterRaw: cursor.raw,
+    timeoutMs: 60_000,
+  });
 }
 
 describe.sequential("hosted Forge casting prompt flow", () => {
@@ -277,8 +369,8 @@ describe.sequential("hosted Forge casting prompt flow", () => {
 
     let cursor = await castSpellAndReturnPriority(sessionId, priority, "Black Lotus");
     cursor = await castSpellAndReturnPriority(sessionId, cursor, "Black Lotus");
-    cursor = await activateManaAbility(sessionId, cursor, "Black Lotus", "White");
-    cursor = await activateManaAbility(sessionId, cursor, "Black Lotus", "Blue");
+    cursor = await activatePriorityManaAbility(sessionId, cursor, "Black Lotus", "W");
+    cursor = await activatePriorityManaAbility(sessionId, cursor, "Black Lotus", "U");
     const sphinxPriority = await passUntilAction(sessionId, cursor, "Sphinx's Revelation");
     const action = findAction(sphinxPriority.prompt, "Sphinx's Revelation");
     const prompt = await chooseAction(sessionId, sphinxPriority, action.index);
@@ -296,7 +388,7 @@ describe.sequential("hosted Forge casting prompt flow", () => {
     ]);
 
     let cursor = await castSpellAndReturnPriority(sessionId, priority, "Black Lotus");
-    cursor = await activateManaAbility(sessionId, cursor, "Black Lotus", "Black");
+    cursor = await activatePriorityManaAbility(sessionId, cursor, "Black Lotus", "B");
     const tormentPriority = await passUntilAction(sessionId, cursor, "Torment of Hailfire");
     const action = findAction(tormentPriority.prompt, "Torment of Hailfire");
     const prompt = await chooseAction(sessionId, tormentPriority, action.index);
@@ -304,6 +396,51 @@ describe.sequential("hosted Forge casting prompt flow", () => {
     expect(prompt.prompt.kind).toBe("choose_number");
     expect(prompt.prompt.sourceCardName).toBe("Torment of Hailfire");
     expect(prompt.prompt.description).toBe("Announce X");
+  });
+
+  it("uses selected Black Lotus priority mana color without a second color prompt", async () => {
+    const { sessionId, priority } = await startAtOpeningPriority([
+      card("Torment of Hailfire"),
+      card("Torment of Hailfire"),
+      ...blackLotuses(6),
+    ]);
+
+    let cursor = await castSpellAndReturnPriority(sessionId, priority, "Black Lotus");
+    cursor = await activatePriorityManaAbility(sessionId, cursor, "Black Lotus", "B");
+    const actions = Array.isArray(cursor.prompt.actions) ? cursor.prompt.actions : [];
+
+    expect(cursor.prompt.kind).toBe("priority");
+    expect(
+      actions.some(
+        (action) => action.kind === "spell" && action.label?.includes("Torment of Hailfire"),
+      ),
+    ).toBe(true);
+  });
+
+  it("resolves Torment of Hailfire empty-hand life loss choices", async () => {
+    const { sessionId, priority } = await startAtOpeningPriority([
+      card("Torment of Hailfire"),
+      card("Torment of Hailfire"),
+      ...blackLotuses(6),
+    ]);
+
+    let cursor = await addBlackLotusMana(sessionId, priority, 3, "B");
+    cursor = await castTormentForX(sessionId, cursor, 6);
+    const afterDiscard = await waitForSnapshot(
+      sessionId,
+      (snapshot) => zoneSize(snapshot, 1, "hand") === 0 && zoneSize(snapshot, 1, "graveyard") === 6,
+    );
+
+    expect(playerLife(afterDiscard, 1)).toBe(20);
+
+    cursor = await addBlackLotusMana(sessionId, cursor, 1, "B");
+    await castTormentForX(sessionId, cursor, 1);
+    const afterLifeLoss = await waitForSnapshot(
+      sessionId,
+      (snapshot) => playerLife(snapshot, 1) === 17 && zoneSize(snapshot, 1, "hand") === 0,
+    );
+
+    expect(zoneSize(afterLifeLoss, 1, "graveyard")).toBe(6);
   });
 
   it("prompts for optional kicker costs before Burst Lightning targets or mana", async () => {
