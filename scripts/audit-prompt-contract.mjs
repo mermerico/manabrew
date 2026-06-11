@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 const root = process.cwd();
@@ -11,20 +11,25 @@ function rustVariantToPromptType(variant) {
   return variant.charAt(0).toLowerCase() + variant.slice(1);
 }
 
-function extractRustPromptVariants() {
+function extractRustEnumVariants(enumName) {
   const source = read("forge-engine/crates/forge-agent-interface/src/prompt.rs");
   const variants = [];
   let inEnum = false;
+  let depth = 0;
   for (const line of source.split("\n")) {
-    if (line.includes("pub enum AgentPromptInner")) {
+    if (line.includes(`pub enum ${enumName}`)) {
       inEnum = true;
+      depth += (line.match(/\{/g) ?? []).length;
+      depth -= (line.match(/\}/g) ?? []).length;
       continue;
-    }
-    if (inEnum && line.startsWith("impl AgentPromptInner")) {
-      break;
     }
     if (!inEnum) {
       continue;
+    }
+    depth += (line.match(/\{/g) ?? []).length;
+    depth -= (line.match(/\}/g) ?? []).length;
+    if (depth <= 0) {
+      break;
     }
     const match = line.match(/^ {4}([A-Z][A-Za-z0-9]*)\s*\{/);
     if (match) {
@@ -35,17 +40,51 @@ function extractRustPromptVariants() {
 }
 
 function extractTsPromptTypes() {
-  const source = read("src/types/promptType.ts");
-  return [...source.matchAll(/^\s*([A-Za-z0-9_]+):\s*"([^"]+)"/gm)].map(
-    ([, key, value]) => ({ key, value }),
-  );
+  const dir = path.join(root, "src/protocol/prompts");
+  return readdirSync(dir)
+    .filter((entry) => entry.endsWith(".ts") && entry !== "index.ts")
+    .flatMap((entry) => {
+      const source = read(path.join("src/protocol/prompts", entry));
+      return [...source.matchAll(/^export type Type = "([^"]+)";/gm)].map(([, value]) => ({
+        key: value,
+        value,
+      }));
+    })
+    .sort((a, b) => a.value.localeCompare(b.value));
 }
 
-function extractPromptTypeReferences(relativePath) {
+function extractObjectLiteral(source, constName) {
+  const start = source.indexOf(`const ${constName}`);
+  if (start < 0) {
+    return "";
+  }
+  const equals = source.indexOf("=", start);
+  const open = source.indexOf("{", equals);
+  if (open < 0) {
+    return "";
+  }
+  let depth = 0;
+  for (let i = open; i < source.length; i += 1) {
+    const ch = source[i];
+    if (ch === "{") {
+      depth += 1;
+    } else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(open, i + 1);
+      }
+    }
+  }
+  return "";
+}
+
+function extractPromptRegistryKeys(relativePath, constName) {
   const source = read(relativePath);
-  return new Set(
-    [...source.matchAll(/PromptType\.([A-Za-z0-9_]+)/g)].map(([, key]) => key),
-  );
+  const registry = extractObjectLiteral(source, constName);
+  return new Set([
+    ...[...registry.matchAll(/\["([^"]+)"\]\s*:/g)].map(([, key]) => key),
+    ...[...registry.matchAll(/^ {2}([a-z][A-Za-z0-9]*)\s*:/gm)].map(([, key]) => key),
+  ]);
 }
 
 function extractJavaPromptKinds() {
@@ -62,32 +101,33 @@ function diff(left, right) {
   return left.filter((item) => !rightSet.has(item));
 }
 
-const rustVariants = extractRustPromptVariants();
+const rustVariants = extractRustEnumVariants("AgentPromptInner");
 const rustPromptTypes = rustVariants.map(rustVariantToPromptType);
 const tsPromptTypes = extractTsPromptTypes();
 const tsKeys = tsPromptTypes.map((entry) => entry.key);
 const tsValues = tsPromptTypes.map((entry) => entry.value);
-const handledKeys = [...extractPromptTypeReferences("src/stores/gameStore.constants.ts")];
-const actionViewKeys = [...extractPromptTypeReferences(
-  "src/components/game/panels/PromptActionController.tsx",
-)];
-const nonActionPromptKeys = new Set(["StateUpdate", "GameOver"]);
+const handlerKeys = [
+  ...extractPromptRegistryKeys(
+    "src/components/game/prompts/promptHandlers.ts",
+    "PROMPT_HANDLER_OVERRIDES",
+  ),
+];
+const modalKeys = [
+  ...extractPromptRegistryKeys("src/components/game/prompts/promptComponents.tsx", "PROMPT_MODALS"),
+];
 const javaKinds = extractJavaPromptKinds();
 
 const missingInTs = diff(rustPromptTypes, tsValues);
 const extraInTs = diff(tsValues, rustPromptTypes);
-const missingHandled = diff(tsKeys, handledKeys);
-const missingActionView = diff(
-  tsKeys.filter((key) => !nonActionPromptKeys.has(key)),
-  actionViewKeys,
-);
+const unknownHandlerKeys = diff(handlerKeys, tsValues);
+const unknownModalKeys = diff(modalKeys, tsValues);
 
 console.log("Prompt contract audit");
 console.log("=====================");
 console.log(`Rust AgentPromptInner variants: ${rustPromptTypes.length}`);
 console.log(`TypeScript PromptType values: ${tsValues.length}`);
-console.log(`UI handled PromptType entries: ${handledKeys.length}`);
-console.log(`Prompt action view mappings: ${actionViewKeys.length}`);
+console.log(`Prompt handler entries: ${handlerKeys.length}`);
+console.log(`Prompt modal entries: ${modalKeys.length}`);
 console.log(`Java normalizer raw prompt kinds: ${javaKinds.join(", ") || "none"}`);
 console.log("");
 
@@ -101,14 +141,14 @@ function printList(title, values) {
 
 printList("Rust prompt types missing from TypeScript", missingInTs);
 printList("TypeScript prompt types missing from Rust", extraInTs);
-printList("TypeScript PromptType keys missing from HANDLED_PROMPT_TYPES", missingHandled);
-printList("TypeScript PromptType keys without prompt action view mapping", missingActionView);
+printList("Prompt handler keys missing from TypeScript", unknownHandlerKeys);
+printList("Prompt modal keys missing from TypeScript", unknownModalKeys);
 
 if (
   missingInTs.length > 0 ||
   extraInTs.length > 0 ||
-  missingHandled.length > 0 ||
-  missingActionView.length > 0
+  unknownHandlerKeys.length > 0 ||
+  unknownModalKeys.length > 0
 ) {
   process.exitCode = 1;
 }

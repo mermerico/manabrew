@@ -129,6 +129,8 @@ public final class ManaBrewInteractiveSession {
             throw new IllegalStateException("session is closed");
         }
         JsonObject action = JsonParser.parseString(actionJson).getAsJsonObject();
+        // The published prompt is no longer actionable once the game thread accepts a response.
+        latestPromptJson = null;
         actions.offer(action);
         // No snapshot here — it would race the game thread this unblocks.
         return "";
@@ -1175,7 +1177,11 @@ public final class ManaBrewInteractiveSession {
             }
             final String actionKind = action.has("kind") ? action.get("kind").getAsString() : "";
             if ("pass".equals(actionKind) || "pass_priority".equals(actionKind)) {
-                return new CardCollection(cards.subList(0, Math.min(min, cards.size())));
+                final CardCollection selected = new CardCollection(cards.subList(0, Math.min(min, cards.size())));
+                if (selected.size() < min || selected.size() > max) {
+                    throw new IllegalArgumentException("selected card count out of range: " + selected.size());
+                }
+                return selected;
             }
             if (!"choose_cards".equals(actionKind)) {
                 throw new UnsupportedOperationException("unsupported action kind: " + actionKind);
