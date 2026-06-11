@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0](https://github.com/witchesofthehill/manabrew/compare/v0.3.0...v0.4.0) (2026-06-11)
+
+
+### Features
+
+* **ui:** playable draft formats, draft ux overhaul, and pick-race fixes ([#148](https://github.com/witchesofthehill/manabrew/issues/148)) ([ecf42bb](https://github.com/witchesofthehill/manabrew/commit/ecf42bb380d723f2d7282b701000ad40835b34e7))
+
+
+### Fixes
+
+* **ci:** match nested artifact paths when attaching release assets ([#159](https://github.com/witchesofthehill/manabrew/issues/159)) ([4a0493a](https://github.com/witchesofthehill/manabrew/commit/4a0493a86d0a81b913a3df58e34f5f7ec8e6a862))
+
 ## [0.3.0](https://github.com/witchesofthehill/manabrew/compare/v0.2.0...v0.3.0) (2026-06-11)
 
 ### Features
