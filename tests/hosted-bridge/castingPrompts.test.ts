@@ -36,6 +36,10 @@ function simianSpiritGuides(count: number) {
   return Array.from({ length: count }, () => card("Simian Spirit Guide"));
 }
 
+function blackLotuses(count: number) {
+  return Array.from({ length: count }, () => card("Black Lotus"));
+}
+
 async function startAtOpeningPriority(deck: Array<{ name: string }>) {
   const candidate = HostedHarness.launch();
   const handle = await candidate.startGame({
@@ -96,6 +100,7 @@ async function passUntilAction(
   sessionId: string,
   current: PromptResult,
   cardName: string,
+  kind = "spell",
   maxPasses = 40,
 ) {
   if (!harness) {
@@ -110,6 +115,7 @@ async function passUntilAction(
           (action) =>
             action &&
             typeof action === "object" &&
+            (action as { kind?: string }).kind === kind &&
             (action as { label?: string }).label?.includes(cardName),
         )
       ) {
@@ -123,6 +129,34 @@ async function passUntilAction(
     }
   }
   throw new Error(`did not reach priority with ${cardName}`);
+}
+
+async function castSpellAndReturnPriority(
+  sessionId: string,
+  current: PromptResult,
+  cardName: string,
+) {
+  const spellPriority = await passUntilAction(sessionId, current, cardName, "spell");
+  const action = findAction(spellPriority.prompt, cardName);
+  return chooseAction(sessionId, spellPriority, action.index, "priority");
+}
+
+async function activateManaAbility(
+  sessionId: string,
+  current: PromptResult,
+  cardName: string,
+  color: string,
+) {
+  const manaPriority = await passUntilAction(sessionId, current, cardName, "mana");
+  const action = findAction(manaPriority.prompt, cardName, "mana");
+  let cursor = await chooseAction(sessionId, manaPriority, action.index, "confirm_action");
+  await harness!.submitAction(sessionId, { kind: "boolean_decision", accept: true });
+  cursor = await harness!.waitForPrompt(sessionId, {
+    kind: "choose_color",
+    afterRaw: cursor.raw,
+  });
+  await harness!.submitAction(sessionId, { kind: "string_decision", value: color });
+  return harness!.waitForPrompt(sessionId, { kind: "priority", afterRaw: cursor.raw });
 }
 
 describe.sequential("hosted Forge casting prompt flow", () => {
@@ -231,6 +265,44 @@ describe.sequential("hosted Forge casting prompt flow", () => {
 
     expect(prompt.prompt.kind).toBe("choose_number");
     expect(prompt.prompt.sourceCardName).toBe("Banefire");
+    expect(prompt.prompt.description).toBe("Announce X");
+  });
+
+  it("announces X for Sphinx's Revelation before mana", async () => {
+    const { sessionId, priority } = await startAtOpeningPriority([
+      card("Sphinx's Revelation"),
+      card("Sphinx's Revelation"),
+      ...blackLotuses(6),
+    ]);
+
+    let cursor = await castSpellAndReturnPriority(sessionId, priority, "Black Lotus");
+    cursor = await castSpellAndReturnPriority(sessionId, cursor, "Black Lotus");
+    cursor = await activateManaAbility(sessionId, cursor, "Black Lotus", "White");
+    cursor = await activateManaAbility(sessionId, cursor, "Black Lotus", "Blue");
+    const sphinxPriority = await passUntilAction(sessionId, cursor, "Sphinx's Revelation");
+    const action = findAction(sphinxPriority.prompt, "Sphinx's Revelation");
+    const prompt = await chooseAction(sessionId, sphinxPriority, action.index);
+
+    expect(prompt.prompt.kind).toBe("choose_number");
+    expect(prompt.prompt.sourceCardName).toBe("Sphinx's Revelation");
+    expect(prompt.prompt.description).toBe("Announce X");
+  });
+
+  it("announces X for Torment of Hailfire before mana", async () => {
+    const { sessionId, priority } = await startAtOpeningPriority([
+      card("Torment of Hailfire"),
+      card("Torment of Hailfire"),
+      ...blackLotuses(6),
+    ]);
+
+    let cursor = await castSpellAndReturnPriority(sessionId, priority, "Black Lotus");
+    cursor = await activateManaAbility(sessionId, cursor, "Black Lotus", "Black");
+    const tormentPriority = await passUntilAction(sessionId, cursor, "Torment of Hailfire");
+    const action = findAction(tormentPriority.prompt, "Torment of Hailfire");
+    const prompt = await chooseAction(sessionId, tormentPriority, action.index);
+
+    expect(prompt.prompt.kind).toBe("choose_number");
+    expect(prompt.prompt.sourceCardName).toBe("Torment of Hailfire");
     expect(prompt.prompt.description).toBe("Announce X");
   });
 
